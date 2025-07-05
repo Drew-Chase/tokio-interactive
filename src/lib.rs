@@ -246,32 +246,37 @@ impl ProcessHandle {
     /// 2. Attempt to acquire the lock on the pool asynchronously.
     /// 3. Look for the process associated with `self.pid`.
     /// 4. If the process has a receiver channel, attempt to get a message using `try_recv`.
-    /// 5. If a message is found, return it as a `Some(String)`.
-    /// 6. If no message is received, retry up to 10 times, with a delay of 10 milliseconds between
-    ///    each retry.
+    /// 5. If a message is found, return it as `Ok(Some(String))`.
+    /// 6. If no message is received, retry up to `MAX_RETRIES` times, with a delay of `RETRY_DELAY_MS`
+    ///    milliseconds between each retry.
     ///
-    /// If no message is received after all retries, or if the process or receiver channel is not
-    /// found, the function returns `None`.
+    /// If no message is received after all retries, the function returns `Ok(None)`.
     ///
     /// # Returns
     ///
-    /// * `Some(String)` - If a message is successfully received from the receiver channel.
-    /// * `None` - If no message is received after retries or if the process or receiver is unavailable.
+    /// * `Ok(Some(String))` - If a message is successfully received from the receiver channel.
+    /// * `Ok(None)` - If no message is received after all retries.
+    /// * `Err(Error)` - If an error occurs during the process, such as:
+    ///   - The process pool is not initialized
+    ///   - The process with the specified PID is not found
+    ///   - The receiver channel is not available
+    ///   - The receiver channel is disconnected
     ///
     /// # Behavior
     ///
     /// - This function uses `tokio::time::sleep` for introducing delays between retries and works
     ///   asynchronously.
-    /// - If the system does not have the required process pool or if the receiver is unavailable, the
-    ///   method will return without further retries.
+    /// - The function uses constants `MAX_RETRIES` (10) and `RETRY_DELAY_MS` (10) to control the
+    ///   retry behavior.
+    /// - The function properly propagates errors that occur during the process.
     ///
     /// # Example
     ///
     /// ```rust
-    /// if let Some(output) = instance.receive_output().await {
-    ///     println!("Received output: {}", output);
-    /// } else {
-    ///     println!("No output received.");
+    /// match instance.receive_output().await {
+    ///     Ok(Some(output)) => println!("Received output: {}", output),
+    ///     Ok(None) => println!("No output received."),
+    ///     Err(e) => eprintln!("Error receiving output: {}", e),
     /// }
     /// ```
     ///
@@ -281,35 +286,96 @@ impl ProcessHandle {
     ///   to access concurrently using mutex-based locking.
     /// - The function makes use of `tokio::sync::Mutex` to handle concurrent executions across
     ///   asynchronous tasks.
-    pub async fn receive_output(&self) -> Option<String> {
+    /// Default timeout for receive_output in milliseconds
+    const DEFAULT_TIMEOUT_MS: u64 = 100;
+
+    /// Helper function to try receiving a message
+    async fn try_receive_message(
+        pid: u32,
+        pool: &mut tokio::sync::MutexGuard<'_, HashMap<u32, AsynchronousInteractiveProcess>>,
+    ) -> Result<Option<String>> {
+        if let Some(process) = pool.get_mut(&pid) {
+            if let Some(receiver) = &mut process.receiver {
+                match receiver.try_recv() {
+                    Ok(msg) => return Ok(Some(msg)),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        return Err(anyhow!("Channel disconnected for process {}", pid));
+                    }
+                }
+            } else {
+                return Err(anyhow!("Receiver not available for process {}", pid));
+            }
+        } else {
+            return Err(anyhow!("Process {} not found", pid));
+        }
+        Ok(None)
+    }
+
+    pub async fn receive_output(&self) -> Result<Option<String>> {
+        // Use the default timeout
+        self.receive_output_with_timeout(std::time::Duration::from_millis(Self::DEFAULT_TIMEOUT_MS)).await
+    }
+
+    /// Receives an output message asynchronously from the process associated with the instance's `pid`
+    /// if available, with a specified timeout.
+    ///
+    /// This function is similar to `receive_output()` but allows specifying a custom timeout duration
+    /// instead of using the default timeout.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - A `std::time::Duration` specifying how long to wait for a message before giving up.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(String))` - If a message is successfully received from the receiver channel.
+    /// * `Ok(None)` - If no message is received before the timeout expires.
+    /// * `Err(Error)` - If an error occurs during the process, such as:
+    ///   - The process pool is not initialized
+    ///   - The process with the specified PID is not found
+    ///   - The receiver channel is not available
+    ///   - The receiver channel is disconnected
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// // Wait for up to 5 seconds for a message
+    /// match instance.receive_output_with_timeout(std::time::Duration::from_secs(5)).await {
+    ///     Ok(Some(output)) => println!("Received output: {}", output),
+    ///     Ok(None) => println!("No output received within timeout."),
+    ///     Err(e) => eprintln!("Error receiving output: {}", e),
+    /// }
+    /// ```
+    pub async fn receive_output_with_timeout(&self, timeout: std::time::Duration) -> Result<Option<String>> {
+        // Define constants for retry parameters
+        const RETRY_DELAY_MS: u64 = 10;
+
         if let Some(process_pool) = PROCESS_POOL.get() {
+            // Try to receive a message immediately
             {
                 let mut pool = process_pool.lock().await;
-                if let Some(process) = pool.get_mut(&self.pid) {
-                    if let Some(receiver) = &mut process.receiver {
-                        match receiver.try_recv() {
-                            Ok(msg) => return Some(msg),
-                            Err(_) => {}
-                        }
-                    }
+                if let Some(msg) = Self::try_receive_message(self.pid, &mut pool).await? {
+                    return Ok(Some(msg));
                 }
             }
 
-            for _ in 0..10 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            // If no message is available, retry with delay until timeout is reached
+            let start_time = std::time::Instant::now();
+            while start_time.elapsed() < timeout {
+                tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
 
                 let mut pool = process_pool.lock().await;
-                if let Some(process) = pool.get_mut(&self.pid) {
-                    if let Some(receiver) = &mut process.receiver {
-                        match receiver.try_recv() {
-                            Ok(msg) => return Some(msg),
-                            Err(_) => {}
-                        }
-                    }
+                if let Some(msg) = Self::try_receive_message(self.pid, &mut pool).await? {
+                    return Ok(Some(msg));
                 }
             }
+
+            // No message after timeout
+            return Ok(None);
         }
-        None
+
+        Err(anyhow!("Process pool not initialized"))
     }
 
     /// Sends the provided input to a process associated with this instance's PID asynchronously.
@@ -461,14 +527,173 @@ impl ProcessHandle {
     ///     eprintln!("Failed to terminate process: {}", e);
     /// }
     /// ```
+    /// Attempts to gracefully shut down the process, falling back to forceful termination if needed.
+    ///
+    /// This method first tries to gracefully shut down the process by:
+    /// - On Linux: Sending a SIGTERM signal
+    /// - On Windows: Sending a WM_CLOSE message to the main window
+    ///
+    /// If the process doesn't exit within the specified timeout, it will forcefully terminate
+    /// the process using the `kill()` method.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - A `std::time::Duration` specifying how long to wait for the process to exit
+    ///   gracefully before forcefully terminating it.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - If the process was successfully shut down (either gracefully or forcefully).
+    /// * `Err(Error)` - If an error occurred during the shutdown process.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// // Try to shut down gracefully, waiting up to 5 seconds before force killing
+    /// if let Err(e) = process.shutdown(std::time::Duration::from_secs(5)).await {
+    ///     eprintln!("Failed to shut down process: {}", e);
+    /// }
+    /// ```
+    pub async fn shutdown(&self, timeout: std::time::Duration) -> Result<()> {
+        // First, try to gracefully shut down the process
+        let graceful_shutdown_result = self.graceful_shutdown().await;
+
+        // If graceful shutdown failed or isn't implemented for this platform, log it but continue
+        if let Err(e) = &graceful_shutdown_result {
+            debug!("Graceful shutdown attempt failed: {}", e);
+            return self.kill().await;
+        }
+
+        // Wait for the process to exit for the specified timeout
+        let start_time = std::time::Instant::now();
+        while start_time.elapsed() < timeout {
+            if !self.is_process_running().await {
+                return Ok(());
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+
+        // If we're here, the process didn't exit gracefully within the timeout
+        // Fall back to forceful termination
+        debug!("Process did not exit gracefully within timeout, forcing termination");
+        self.kill().await
+    }
+
+    /// Attempts to gracefully shut down the process without forceful termination.
+    ///
+    /// This method is platform-specific:
+    /// - On Linux: Sends a SIGTERM signal to request graceful termination
+    /// - On Windows: First tries to send a Ctrl+C event to the process using GenerateConsoleCtrlEvent.
+    ///   If that fails, it attempts to send an "exit" command to the process via stdin.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - If the graceful shutdown signal was successfully sent.
+    /// * `Err(Error)` - If an error occurred while sending the graceful shutdown signal.
+    ///
+    /// # Notes
+    ///
+    /// - A successful return doesn't guarantee the process will actually exit.
+    ///   Use `shutdown()` with a timeout to ensure the process exits.
+    /// - On Windows, the GenerateConsoleCtrlEvent function works with process groups, not individual
+    ///   processes, so it may not work for all processes. The fallback "exit" command approach
+    ///   works for many command-line applications that accept such commands.
+    /// - For GUI applications on Windows, neither approach may work. In such cases, the `shutdown()`
+    ///   method will fall back to forceful termination after the timeout.
+    async fn graceful_shutdown(&self) -> Result<()> {
+        #[cfg(target_os = "windows")]
+        {
+            unsafe {
+                // First, try to send Ctrl+C event to the process
+                // CTRL_C_EVENT = 0, CTRL_BREAK_EVENT = 1
+                // Note: GenerateConsoleCtrlEvent works with process groups, not individual processes
+                // For console applications, we can try sending Ctrl+C to the process
+                let result = winapi::um::wincon::GenerateConsoleCtrlEvent(0, self.pid);
+                if result == 0 {
+                    return Err(anyhow!(
+                        "Failed to send Ctrl+C to process {}: {}",
+                        self.pid,
+                        std::io::Error::last_os_error()
+                    ));
+                }
+            }
+            return Ok(());
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            unsafe {
+                // Use the kill system call with SIGTERM (15) to request graceful termination
+                let result = libc::kill(self.pid as libc::pid_t, libc::SIGTERM);
+                if result != 0 {
+                    return Err(anyhow!(
+                        "Failed to send SIGTERM to process {}: {}",
+                        self.pid,
+                        std::io::Error::last_os_error()
+                    ));
+                }
+            }
+            return Ok(());
+        }
+
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        {
+            return Err(anyhow!("Graceful shutdown not implemented for this platform"));
+        }
+    }
+
+    /// Forcefully terminates the process immediately.
+    ///
+    /// This method should be used as a last resort when a process needs to be terminated
+    /// immediately. For a more graceful approach, consider using `shutdown()` first.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - If the process was successfully terminated.
+    /// * `Err(Error)` - If an error occurred during the termination process.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// if let Err(e) = process.kill().await {
+    ///     eprintln!("Failed to terminate process: {}", e);
+    /// }
+    /// ```
     pub async fn kill(&self) -> Result<()> {
         #[cfg(target_os = "windows")]
         {
-            // get handle via pid
             unsafe {
+                // PROCESS_TERMINATE (0x00010000) access right is required to terminate a process
                 let handle = winapi::um::processthreadsapi::OpenProcess(0x00010000, 0, self.pid);
-                winapi::um::processthreadsapi::TerminateProcess(handle, 0);
-            };
+                if handle.is_null() {
+                    return Err(anyhow!("Failed to open process {}: {}", self.pid, std::io::Error::last_os_error()));
+                }
+
+                // Attempt to terminate the process
+                let result = winapi::um::processthreadsapi::TerminateProcess(handle, 0);
+
+                // Always close the handle to prevent resource leaks
+                let close_result = winapi::um::handleapi::CloseHandle(handle);
+
+                // Check if termination was successful
+                if result == 0 {
+                    return Err(anyhow!(
+                        "Failed to terminate process {}: {}",
+                        self.pid,
+                        std::io::Error::last_os_error()
+                    ));
+                }
+
+                // Check if handle was closed successfully
+                if close_result == 0 {
+                    warn!(
+                        "Failed to close process handle for process {}: {}",
+                        self.pid,
+                        std::io::Error::last_os_error()
+                    );
+                    // We don't return an error here as the process was terminated successfully
+                }
+            }
         }
         #[cfg(target_os = "linux")]
         {
