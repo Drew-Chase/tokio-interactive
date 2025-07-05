@@ -1,9 +1,17 @@
+use log::{LevelFilter, info};
 use std::time::Duration;
 use tokio_interactive::AsynchronousInteractiveProcess;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let pid = AsynchronousInteractiveProcess::new("test_server/target/release/test_server.exe").start().await?;
+    pretty_env_logger::env_logger::builder().format_timestamp(None).filter_level(LevelFilter::Debug).init();
+    info!("test server example");
+    let pid = AsynchronousInteractiveProcess::new("cargo")
+        .with_argument("run")
+        .with_argument("--release")
+        .with_working_directory("./examples/test_server")
+        .start()
+        .await?;
 
     // From another thread...
     let reader_thread = tokio::spawn(async move {
