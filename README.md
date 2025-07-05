@@ -1,6 +1,6 @@
-# AISPH - Asynchronous Interactive Singleton Process Handler
+# tokio-interactive
 
-AISPH is a Rust library that provides a convenient way to start, interact with, and manage external processes asynchronously. It allows bidirectional communication with processes, making it ideal for applications that need to control interactive command-line programs.
+tokio-interactive is a Rust library that provides a convenient way to start, interact with, and manage external processes asynchronously. It allows bidirectional communication with processes, making it ideal for applications that need to control interactive command-line programs.
 
 ## Features
 
@@ -17,15 +17,30 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-aisph = "0.1.0"
+tokio-interactive = "0.1.0"
 ```
+
+## Compatibility
+
+- **Rust Version**: This library requires Rust 2021 edition or later.
+- **Tokio Version**: Compatible with Tokio 1.46.1 or later.
+- **Platform Support**: Windows and Linux are fully supported. Other platforms may work but are not officially supported.
+
+### Dependencies
+
+- **tokio**: For asynchronous runtime and process management
+- **anyhow**: For error handling
+- **log**: For logging
+- **serde**: For serialization/deserialization support
+- **winapi**: For Windows-specific process management (Windows only)
+- **libc**: For Linux-specific process management (Linux only)
 
 ## Usage
 
 ### Basic Example
 
 ```rust
-use aisph::AsynchronousInteractiveProcess;
+use tokio_interactive::AsynchronousInteractiveProcess;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -43,8 +58,10 @@ async fn main() -> anyhow::Result<()> {
     process.send_input("some command").await?;
 
     // Receive output from the process
-    if let Some(output) = process.receive_output().await {
-        println!("Process output: {}", output);
+    match process.receive_output().await {
+        Ok(Some(output)) => println!("Process output: {}", output),
+        Ok(None) => println!("No output available"),
+        Err(e) => eprintln!("Error receiving output: {}", e),
     }
 
     // Check if the process is still running
@@ -62,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
 For long-running processes, you can spawn a separate task to handle the communication:
 
 ```rust
-use aisph::AsynchronousInteractiveProcess;
+use tokio_interactive::AsynchronousInteractiveProcess;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -79,9 +96,17 @@ async fn main() -> anyhow::Result<()> {
             process.send_input("status").await?;
 
             // Process output
-            if let Some(output) = process.receive_output().await {
-                // Handle output
-                println!("Server: {}", output);
+            match process.receive_output().await {
+                Ok(Some(output)) => {
+                    // Handle output
+                    println!("Server: {}", output);
+                },
+                Ok(None) => {
+                    // No output available
+                },
+                Err(e) => {
+                    eprintln!("Error receiving output: {}", e);
+                }
             }
 
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -99,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
 
 ### Working with Command-Line Arguments
 
-AISPH provides two methods for setting command-line arguments for your processes:
+tokio-interactive provides two methods for setting command-line arguments for your processes:
 
 #### `with_argument`
 
@@ -161,10 +186,12 @@ The main struct for creating and managing interactive processes.
 
 A handle for interacting with a running process.
 
-- `receive_output(&self) -> Option<String>`: Receive output from the process
+- `receive_output(&self) -> Result<Option<String>>`: Receive output from the process with default timeout
+- `receive_output_with_timeout(&self, timeout: Duration) -> Result<Option<String>>`: Receive output with custom timeout
 - `send_input(&self, input: impl Into<String>) -> Result<()>`: Send input to the process
 - `is_process_running(&self) -> bool`: Check if the process is running
-- `kill(&self) -> Result<()>`: Terminate the process
+- `shutdown(&self, timeout: Duration) -> Result<()>`: Gracefully shut down the process with timeout
+- `kill(&self) -> Result<()>`: Forcefully terminate the process
 
 ## License
 
