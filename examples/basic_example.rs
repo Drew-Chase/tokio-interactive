@@ -1,4 +1,5 @@
-use aisph::AsynchronousInteractiveProcess;
+use std::time::Duration;
+use tokio_interactive::AsynchronousInteractiveProcess;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -17,7 +18,8 @@ async fn main() -> anyhow::Result<()> {
             }
 
             if i > 10 {
-                if let Err(e) = process.kill().await {
+                // Safely shutdown the process after 10 iterations
+                if let Err(e) = process.shutdown(Duration::from_secs(5)).await {
                     eprintln!("[SERVER ERROR]: {}", e);
                 } else {
                     println!("[SERVER]: Process killed after 10 iterations.");
@@ -27,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
 
             // Read output from the process
             let line = process.receive_output().await;
-            if let Some(output) = line {
+            if let Ok(Some(output)) = line {
                 println!("[SERVER]: {}", output);
                 i += 1;
             }
