@@ -1,5 +1,4 @@
 use log::{debug, error, info, LevelFilter};
-use std::time::Duration;
 use tokio_interactive::AsynchronousInteractiveProcess;
 
 #[tokio::main]
