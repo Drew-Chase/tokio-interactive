@@ -122,6 +122,18 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+### Exit Callback Example
+You can set an exit callback to perform actions when the process exits:
+
+```rust
+let pid = AsynchronousInteractiveProcess::new("cargo")
+// ...
+.process_exit_callback(|exit_code| {
+    info!("[SERVER]: Process exited with code {}", exit_code);
+})
+```
+
+
 ### Working with Command-Line Arguments
 
 tokio-interactive provides two methods for setting command-line arguments for your processes:

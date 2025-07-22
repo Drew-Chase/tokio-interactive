@@ -1,4 +1,4 @@
-use log::{LevelFilter, info};
+use log::{debug, error, info, LevelFilter};
 use std::time::Duration;
 use tokio_interactive::AsynchronousInteractiveProcess;
 
@@ -10,6 +10,9 @@ async fn main() -> anyhow::Result<()> {
         .with_argument("run")
         .with_argument("--release")
         .with_working_directory("./examples/test_server")
+        .process_exit_callback(|exit_code| {
+            info!("[SERVER]: Process exited with code {}", exit_code);
+        })
         .start()
         .await?;
 
@@ -21,24 +24,19 @@ async fn main() -> anyhow::Result<()> {
             // Send input to the process every 5 iterations
             if i % 5 == 0 {
                 if let Err(e) = process.send_input("echo this").await {
-                    eprintln!("[SERVER ERROR]: {}", e);
+                    error!("[SERVER ERROR]: {}", e);
                 }
             }
 
             if i > 10 {
                 // Safely shutdown the process after 10 iterations
-                if let Err(e) = process.shutdown(Duration::from_secs(5)).await {
-                    eprintln!("[SERVER ERROR]: {}", e);
-                } else {
-                    println!("[SERVER]: Process killed after 10 iterations.");
-                    break;
-                }
+                process.send_input("exit").await.unwrap();
             }
 
             // Read output from the process
             let line = process.receive_output().await;
             if let Ok(Some(output)) = line {
-                println!("[SERVER]: {}", output);
+                debug!("[SERVER]: {}", output);
                 i += 1;
             }
         }

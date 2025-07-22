@@ -1,14 +1,16 @@
 #![doc = include_str!("../README.md")]
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use log::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::fmt::{Debug, Formatter};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Mutex;
-use tokio::sync::mpsc::{Receiver, Sender}; // Change this line
+// Change this line
 
 /// A static, lazily-initialized process pool used to manage asynchronous interactive processes.
 ///
@@ -131,7 +133,7 @@ pub struct ProcessHandle {
 ///
 /// This structure is ideal for scenarios where processes need to be controlled
 /// asynchronously with multiple input or output channels.
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
 pub struct AsynchronousInteractiveProcess {
     pub pid: Option<u32>,
     pub filename: String,
@@ -143,6 +145,14 @@ pub struct AsynchronousInteractiveProcess {
     receiver: Option<Receiver<String>>,
     #[serde(skip)]
     input_queue: VecDeque<String>,
+    #[serde(skip)]
+    exit_callback: Option<Arc<dyn Fn(i32) + Send + Sync>>,
+}
+
+impl Debug for AsynchronousInteractiveProcess{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AsynchronousInteractiveProcess {{ pid: {:?}, filename: {:?}, arguments: {:?}, working_directory: {:?} }}", self.pid, self.filename, self.arguments, self.working_directory)
+    }
 }
 
 impl ProcessHandle {
@@ -661,6 +671,7 @@ impl AsynchronousInteractiveProcess {
             sender: None,
             receiver: None,
             input_queue: VecDeque::new(),
+            exit_callback: None,
         }
     }
 
@@ -729,6 +740,14 @@ impl AsynchronousInteractiveProcess {
     /// ```
     pub fn with_working_directory(mut self, dir: impl Into<PathBuf>) -> Self {
         self.working_directory = dir.into();
+        self
+    }
+
+    pub fn process_exit_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(i32) + Send + Sync + 'static,
+    {
+        self.exit_callback = Some(Arc::new(callback));
         self
     }
 
@@ -894,13 +913,28 @@ impl AsynchronousInteractiveProcess {
             }
         });
 
+        let exit_callback = self.exit_callback.clone();
         tokio::spawn(async move {
-            if let Err(e) = child.wait().await {
-                error!("Process {} exited with error: {}", pid, e);
-            } else {
-                debug!("Process {} exited successfully", pid);
+            match child.wait().await {
+                Ok(exit_status) => {
+                    let exit_code = exit_status.code().unwrap_or(-1); // Use -1 for unknown exit codes
+                    debug!("Process {} exited with code: {}", pid, exit_code);
+
+                    if let Some(exit_callback) = exit_callback {
+                        exit_callback(exit_code);
+                    }
+                }
+                Err(e) => {
+                    error!("Process {} exited with error: {}", pid, e);
+
+                    // Still trigger callback with error code
+                    if let Some(exit_callback) = exit_callback {
+                        exit_callback(-1); // or some other error indicator
+                    }
+                }
             }
 
+            // Cleanup
             if let Some(process_pool) = PROCESS_POOL.get() {
                 let mut pool = process_pool.lock().await;
                 pool.remove(&pid);
@@ -921,6 +955,7 @@ impl AsynchronousInteractiveProcess {
                 sender: Some(stdin_sender),
                 receiver: Some(stdout_receiver),
                 input_queue: VecDeque::new(),
+                exit_callback: self.exit_callback.clone(),
             },
         );
 
