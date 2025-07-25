@@ -2,7 +2,7 @@
 name = "tokio-interactive"
 description = "Asynchronous Interactive Process Management with Tokio"
 authors = ["Drew Chase"]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/Drew-Chase/tokio-interactive.git"

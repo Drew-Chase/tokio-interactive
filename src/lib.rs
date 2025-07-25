@@ -149,9 +149,13 @@ pub struct AsynchronousInteractiveProcess {
     exit_callback: Option<Arc<dyn Fn(i32) + Send + Sync>>,
 }
 
-impl Debug for AsynchronousInteractiveProcess{
+impl Debug for AsynchronousInteractiveProcess {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "AsynchronousInteractiveProcess {{ pid: {:?}, filename: {:?}, arguments: {:?}, working_directory: {:?} }}", self.pid, self.filename, self.arguments, self.working_directory)
+        write!(
+            f,
+            "AsynchronousInteractiveProcess {{ pid: {:?}, filename: {:?}, arguments: {:?}, working_directory: {:?} }}",
+            self.pid, self.filename, self.arguments, self.working_directory
+        )
     }
 }
 
@@ -364,9 +368,7 @@ impl ProcessHandle {
                                 process.input_queue.push_back(input_str);
                                 Ok(())
                             }
-                            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                                Err(anyhow!("Failed to send input: channel closed"))
-                            }
+                            tokio::sync::mpsc::error::TrySendError::Closed(_) => Err(anyhow!("Failed to send input: channel closed")),
                         },
                     }
                 } else {
@@ -531,11 +533,7 @@ impl ProcessHandle {
                 // For console applications, we can try sending Ctrl+C to the process
                 let result = winapi::um::wincon::GenerateConsoleCtrlEvent(0, self.pid);
                 if result == 0 {
-                    return Err(anyhow!(
-                        "Failed to send Ctrl+C to process {}: {}",
-                        self.pid,
-                        std::io::Error::last_os_error()
-                    ));
+                    return Err(anyhow!("Failed to send Ctrl+C to process {}: {}", self.pid, std::io::Error::last_os_error()));
                 }
             }
             return Ok(());
@@ -547,11 +545,7 @@ impl ProcessHandle {
                 // Use the kill system call with SIGTERM (15) to request graceful termination
                 let result = libc::kill(self.pid as libc::pid_t, libc::SIGTERM);
                 if result != 0 {
-                    return Err(anyhow!(
-                        "Failed to send SIGTERM to process {}: {}",
-                        self.pid,
-                        std::io::Error::last_os_error()
-                    ));
+                    return Err(anyhow!("Failed to send SIGTERM to process {}: {}", self.pid, std::io::Error::last_os_error()));
                 }
             }
             return Ok(());
@@ -598,20 +592,12 @@ impl ProcessHandle {
 
                 // Check if termination was successful
                 if result == 0 {
-                    return Err(anyhow!(
-                        "Failed to terminate process {}: {}",
-                        self.pid,
-                        std::io::Error::last_os_error()
-                    ));
+                    return Err(anyhow!("Failed to terminate process {}: {}", self.pid, std::io::Error::last_os_error()));
                 }
 
                 // Check if handle was closed successfully
                 if close_result == 0 {
-                    warn!(
-                        "Failed to close process handle for process {}: {}",
-                        self.pid,
-                        std::io::Error::last_os_error()
-                    );
+                    warn!("Failed to close process handle for process {}: {}", self.pid, std::io::Error::last_os_error());
                     // We don't return an error here as the process was terminated successfully
                 }
             }
@@ -813,14 +799,48 @@ impl AsynchronousInteractiveProcess {
     pub async fn start(&mut self) -> Result<u32> {
         let mut command = Command::new(&self.filename);
         command.args(&self.arguments);
-        command.current_dir(&self.working_directory);
+
+        // Convert UNC path to regular Windows path if needed
+        let working_dir = if cfg!(windows) {
+            // Remove UNC prefix if present
+            let path_str = self.working_directory.to_string_lossy();
+            if path_str.starts_with(r"\\?\") {
+                PathBuf::from(&path_str[4..]) // Remove the \\?\ prefix
+            } else {
+                self.working_directory.clone()
+            }
+        } else {
+            self.working_directory.clone()
+        };
+
+        // Debug the working directory
+        debug!("tokio-interactive: filename = {}", self.filename);
+        debug!("tokio-interactive: arguments = {:?}", self.arguments);
+        debug!("tokio-interactive: working_directory = {:?}", working_dir);
+        debug!("tokio-interactive: working_directory exists = {}", working_dir.exists());
+        debug!("tokio-interactive: working_directory is_dir = {}", working_dir.is_dir());
+
+        // Check if working directory is absolute
+        debug!("tokio-interactive: working_directory is_absolute = {}", working_dir.is_absolute());
+
+        // Get current directory before setting
+        if let Ok(current_dir) = std::env::current_dir() {
+            debug!("tokio-interactive: current working directory before setting = {:?}", current_dir);
+        }
+
+        command.current_dir(working_dir);
 
         command.stdin(std::process::Stdio::piped());
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
 
+        // Debug the final command that will be executed
+        debug!("tokio-interactive: Final command = {:?}", command);
+
         let mut child = command.spawn()?;
         let pid = child.id().unwrap_or(0);
+
+        debug!("tokio-interactive: Process spawned with PID = {}", pid);
 
         let (stdin_sender, mut stdin_receiver) = tokio::sync::mpsc::channel::<String>(100);
         let (stdout_sender, stdout_receiver) = tokio::sync::mpsc::channel::<String>(100);
