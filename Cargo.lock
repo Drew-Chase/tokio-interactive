@@ -309,9 +309,10 @@ dependencies = [
 
 [[package]]
 name = "tokio-interactive"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
+ "env_logger",
  "libc",
  "log",
  "pretty_env_logger",

@@ -1,5 +1,5 @@
 #![doc = include_str!("../README.md")]
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use log::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -8,8 +8,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::Sender;
+use tokio::sync::broadcast;
 // Change this line
 
 /// A static, lazily-initialized process pool used to manage asynchronous interactive processes.
@@ -68,9 +69,10 @@ static PROCESS_POOL: OnceLock<Arc<Mutex<HashMap<u32, AsynchronousInteractiveProc
 /// let cloned_handle = handle.clone();
 /// println!("{:?}", cloned_handle); // Outputs: ProcessHandle { pid: 1234 }
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ProcessHandle {
     pid: u32,
+    receiver: broadcast::Receiver<String>,
 }
 
 /// `AsynchronousInteractiveProcess` is a structure that represents a non-blocking,
@@ -142,7 +144,9 @@ pub struct AsynchronousInteractiveProcess {
     #[serde(skip)]
     sender: Option<Sender<String>>,
     #[serde(skip)]
-    receiver: Option<Receiver<String>>,
+    output_broadcaster: Option<broadcast::Sender<String>>,
+    #[serde(skip)]
+    _keep_alive_receiver: Option<broadcast::Receiver<String>>,
     #[serde(skip)]
     input_queue: VecDeque<String>,
     #[serde(skip)]
@@ -214,30 +218,8 @@ impl ProcessHandle {
     /// Default timeout for receive_output in milliseconds
     const DEFAULT_TIMEOUT_MS: u64 = 100;
 
-    /// Helper function to try receiving a message
-    async fn try_receive_message(
-        pid: u32,
-        pool: &mut tokio::sync::MutexGuard<'_, HashMap<u32, AsynchronousInteractiveProcess>>,
-    ) -> Result<Option<String>> {
-        if let Some(process) = pool.get_mut(&pid) {
-            if let Some(receiver) = &mut process.receiver {
-                match receiver.try_recv() {
-                    Ok(msg) => return Ok(Some(msg)),
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
-                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                        return Err(anyhow!("Channel disconnected for process {}", pid));
-                    }
-                }
-            } else {
-                return Err(anyhow!("Receiver not available for process {}", pid));
-            }
-        } else {
-            return Err(anyhow!("Process {} not found", pid));
-        }
-        Ok(None)
-    }
 
-    pub async fn receive_output(&self) -> Result<Option<String>> {
+    pub async fn receive_output(&mut self) -> Result<Option<String>> {
         // Use the default timeout
         self.receive_output_with_timeout(std::time::Duration::from_millis(Self::DEFAULT_TIMEOUT_MS)).await
     }
@@ -272,35 +254,41 @@ impl ProcessHandle {
     ///     Err(e) => eprintln!("Error receiving output: {}", e),
     /// }
     /// ```
-    pub async fn receive_output_with_timeout(&self, timeout: std::time::Duration) -> Result<Option<String>> {
+    pub async fn receive_output_with_timeout(&mut self, timeout: std::time::Duration) -> Result<Option<String>> {
         // Define constants for retry parameters
         const RETRY_DELAY_MS: u64 = 10;
 
-        if let Some(process_pool) = PROCESS_POOL.get() {
-            // Try to receive a message immediately
-            {
-                let mut pool = process_pool.lock().await;
-                if let Some(msg) = Self::try_receive_message(self.pid, &mut pool).await? {
-                    return Ok(Some(msg));
-                }
+        // Try to receive a message immediately
+        match self.receiver.try_recv() {
+            Ok(msg) => return Ok(Some(msg)),
+            Err(broadcast::error::TryRecvError::Empty) => {}
+            Err(broadcast::error::TryRecvError::Closed) => {
+                return Err(anyhow!("Broadcast channel closed for process {}", self.pid));
             }
-
-            // If no message is available, retry with delay until timeout is reached
-            let start_time = std::time::Instant::now();
-            while start_time.elapsed() < timeout {
-                tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
-
-                let mut pool = process_pool.lock().await;
-                if let Some(msg) = Self::try_receive_message(self.pid, &mut pool).await? {
-                    return Ok(Some(msg));
-                }
+            Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                // Messages were dropped due to lag, but we can continue
             }
-
-            // No message after timeout
-            return Ok(None);
         }
 
-        Err(anyhow!("Process pool not initialized"))
+        // If no message is available, retry with delay until timeout is reached
+        let start_time = std::time::Instant::now();
+        while start_time.elapsed() < timeout {
+            tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+
+            match self.receiver.try_recv() {
+                Ok(msg) => return Ok(Some(msg)),
+                Err(broadcast::error::TryRecvError::Empty) => {}
+                Err(broadcast::error::TryRecvError::Closed) => {
+                    return Err(anyhow!("Broadcast channel closed for process {}", self.pid));
+                }
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                    // Messages were dropped due to lag, but we can continue
+                }
+            }
+        }
+
+        // No message after timeout
+        Ok(None)
     }
 
     /// Sends the provided input to a process associated with this instance's PID asynchronously.
@@ -368,7 +356,9 @@ impl ProcessHandle {
                                 process.input_queue.push_back(input_str);
                                 Ok(())
                             }
-                            tokio::sync::mpsc::error::TrySendError::Closed(_) => Err(anyhow!("Failed to send input: channel closed")),
+                            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                                Err(anyhow!("Failed to send input: channel closed"))
+                            }
                         },
                     }
                 } else {
@@ -533,7 +523,11 @@ impl ProcessHandle {
                 // For console applications, we can try sending Ctrl+C to the process
                 let result = winapi::um::wincon::GenerateConsoleCtrlEvent(0, self.pid);
                 if result == 0 {
-                    return Err(anyhow!("Failed to send Ctrl+C to process {}: {}", self.pid, std::io::Error::last_os_error()));
+                    return Err(anyhow!(
+                        "Failed to send Ctrl+C to process {}: {}",
+                        self.pid,
+                        std::io::Error::last_os_error()
+                    ));
                 }
             }
             return Ok(());
@@ -545,7 +539,11 @@ impl ProcessHandle {
                 // Use the kill system call with SIGTERM (15) to request graceful termination
                 let result = libc::kill(self.pid as libc::pid_t, libc::SIGTERM);
                 if result != 0 {
-                    return Err(anyhow!("Failed to send SIGTERM to process {}: {}", self.pid, std::io::Error::last_os_error()));
+                    return Err(anyhow!(
+                        "Failed to send SIGTERM to process {}: {}",
+                        self.pid,
+                        std::io::Error::last_os_error()
+                    ));
                 }
             }
             return Ok(());
@@ -592,12 +590,20 @@ impl ProcessHandle {
 
                 // Check if termination was successful
                 if result == 0 {
-                    return Err(anyhow!("Failed to terminate process {}: {}", self.pid, std::io::Error::last_os_error()));
+                    return Err(anyhow!(
+                        "Failed to terminate process {}: {}",
+                        self.pid,
+                        std::io::Error::last_os_error()
+                    ));
                 }
 
                 // Check if handle was closed successfully
                 if close_result == 0 {
-                    warn!("Failed to close process handle for process {}: {}", self.pid, std::io::Error::last_os_error());
+                    warn!(
+                        "Failed to close process handle for process {}: {}",
+                        self.pid,
+                        std::io::Error::last_os_error()
+                    );
                     // We don't return an error here as the process was terminated successfully
                 }
             }
@@ -655,7 +661,8 @@ impl AsynchronousInteractiveProcess {
             arguments: Vec::new(),
             working_directory: PathBuf::from("./"),
             sender: None,
-            receiver: None,
+            output_broadcaster: None,
+            _keep_alive_receiver: None,
             input_queue: VecDeque::new(),
             exit_callback: None,
         }
@@ -843,7 +850,7 @@ impl AsynchronousInteractiveProcess {
         debug!("tokio-interactive: Process spawned with PID = {}", pid);
 
         let (stdin_sender, mut stdin_receiver) = tokio::sync::mpsc::channel::<String>(100);
-        let (stdout_sender, stdout_receiver) = tokio::sync::mpsc::channel::<String>(100);
+        let (stdout_broadcaster, _keep_alive_receiver) = broadcast::channel::<String>(100);
 
         if let Some(mut stdin) = child.stdin.take() {
             tokio::spawn(async move {
@@ -865,7 +872,7 @@ impl AsynchronousInteractiveProcess {
         }
 
         if let Some(stdout) = child.stdout.take() {
-            let stdout_sender_clone = stdout_sender.clone();
+            let stdout_broadcaster_clone = stdout_broadcaster.clone();
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stdout);
                 let mut line = String::new();
@@ -873,8 +880,8 @@ impl AsynchronousInteractiveProcess {
                     if bytes_read == 0 {
                         break;
                     }
-                    if let Err(e) = stdout_sender_clone.send(line.trim_end().to_string()).await {
-                        error!("Failed to send stdout message: {}", e);
+                    if let Err(e) = stdout_broadcaster_clone.send(line.trim_end().to_string()) {
+                        error!("Failed to broadcast stdout message: {}", e);
                         break;
                     }
                     line.clear();
@@ -883,7 +890,7 @@ impl AsynchronousInteractiveProcess {
         }
 
         if let Some(stderr) = child.stderr.take() {
-            let stderr_sender = stdout_sender.clone();
+            let stderr_broadcaster = stdout_broadcaster.clone();
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr);
                 let mut line = String::new();
@@ -891,8 +898,8 @@ impl AsynchronousInteractiveProcess {
                     if bytes_read == 0 {
                         break;
                     }
-                    if let Err(e) = stderr_sender.send(format!("STDERR: {}", line.trim_end())).await {
-                        error!("Failed to send stderr message: {}", e);
+                    if let Err(e) = stderr_broadcaster.send(format!("STDERR: {}", line.trim_end())) {
+                        error!("Failed to broadcast stderr message: {}", e);
                         break;
                     }
                     line.clear();
@@ -973,7 +980,8 @@ impl AsynchronousInteractiveProcess {
                 arguments: self.arguments.clone(),
                 working_directory: self.working_directory.clone(),
                 sender: Some(stdin_sender),
-                receiver: Some(stdout_receiver),
+                output_broadcaster: Some(stdout_broadcaster.clone()),
+                _keep_alive_receiver: Some(_keep_alive_receiver),
                 input_queue: VecDeque::new(),
                 exit_callback: self.exit_callback.clone(),
             },
@@ -1023,7 +1031,16 @@ impl AsynchronousInteractiveProcess {
     pub async fn get_process_by_pid(pid: u32) -> Option<ProcessHandle> {
         let process_pool = PROCESS_POOL.get()?;
         let pool = process_pool.lock().await;
-        if pool.contains_key(&pid) { Some(ProcessHandle { pid }) } else { None }
+        if let Some(process) = pool.get(&pid) {
+            if let Some(broadcaster) = &process.output_broadcaster {
+                let receiver = broadcaster.subscribe();
+                Some(ProcessHandle { pid, receiver })
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     }
 
     /// Asynchronously checks if a process identified by its `pid` is currently running.

@@ -2,7 +2,7 @@
 name = "tokio-interactive"
 description = "Asynchronous Interactive Process Management with Tokio"
 authors = ["Drew Chase"]
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/Drew-Chase/tokio-interactive.git"
@@ -14,6 +14,7 @@ anyhow = ">=1.0"
 log = ">=0.4"
 serde = { version = ">=1.0", features = ["derive"] }
 pretty_env_logger = { version = "0.5.0", optional = true }
+env_logger = ">=0.10"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winapi = { version = ">=0.3", features = ["processthreadsapi", "handleapi", "errhandlingapi", "wincon"] }
